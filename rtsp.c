@@ -1691,7 +1691,7 @@ void handle_pair_verify(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *r
   int ret;
   uint8_t *body = NULL;
   size_t body_len = 0;
-  // struct pair_result *result;
+  struct pair_result *result = NULL;
 
   if (!conn->ap2_pairing_context.verify_ctx) {
     conn->ap2_pairing_context.verify_ctx =
@@ -1711,23 +1711,44 @@ void handle_pair_verify(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *r
     goto out;
   }
 
-  /*
-    ret = pair_verify_result(&result, conn->ap2_pairing_context.verify_ctx);
-    if (ret == 0 && result->shared_secret_len > 0) {
-      conn->ap2_pairing_context.control_cipher_bundle.cipher_ctx =
-          pair_cipher_new(PAIR_SERVER_HOMEKIT, 3, result->shared_secret, result->shared_secret_len);
-      if (!conn->ap2_pairing_context.control_cipher_bundle.cipher_ctx) {
-        debug(1, "Error setting up rtsp control channel ciphering\n");
-        goto out;
-      }
-      conn->ap2_pairing_context.event_cipher_bundle.cipher_ctx =
-          pair_cipher_new(PAIR_SERVER_HOMEKIT, 4, result->shared_secret, result->shared_secret_len);
-      if (!conn->ap2_pairing_context.event_cipher_bundle.cipher_ctx) {
-        debug(1, "Error setting up rtsp event channel ciphering\n");
-        goto out;
-      }
+  ret = pair_verify_result(&result, conn->ap2_pairing_context.verify_ctx);
+  if (ret == 0 && result && result->shared_secret_len > 0) {
+    conn->pair_verify_result = result; // keep it for the audio stream key
+    // Normal (non-transient) pairing: the session key is derived during
+    // pair-verify, not during pair-setup. Replace any cipher built from the
+    // pair-setup secret, otherwise the first encrypted control message from
+    // the client cannot be decrypted and the client resets the connection.
+    if (conn->ap2_pairing_context.control_cipher_bundle.cipher_ctx) {
+      pair_cipher_free(conn->ap2_pairing_context.control_cipher_bundle.cipher_ctx);
+      conn->ap2_pairing_context.control_cipher_bundle.cipher_ctx = NULL;
     }
-  */
+    conn->ap2_pairing_context.control_cipher_bundle.cipher_ctx =
+        pair_cipher_new(PAIR_SERVER_HOMEKIT, 3, result->shared_secret,
+                        result->shared_secret_len, "");
+    if (!conn->ap2_pairing_context.control_cipher_bundle.cipher_ctx) {
+      debug(1, "Error setting up rtsp control channel ciphering");
+      goto out;
+    }
+    if (!conn->ap2_pairing_context.control_cipher_bundle.description)
+      conn->ap2_pairing_context.control_cipher_bundle.description = strdup("Control Stream");
+
+    if (conn->ap2_pairing_context.event_cipher_bundle.cipher_ctx) {
+      pair_cipher_free(conn->ap2_pairing_context.event_cipher_bundle.cipher_ctx);
+      conn->ap2_pairing_context.event_cipher_bundle.cipher_ctx = NULL;
+    }
+    conn->ap2_pairing_context.event_cipher_bundle.cipher_ctx =
+        pair_cipher_new(PAIR_SERVER_HOMEKIT, 4, result->shared_secret,
+                        result->shared_secret_len, "");
+    if (!conn->ap2_pairing_context.event_cipher_bundle.cipher_ctx) {
+      debug(1, "Error setting up rtsp event channel ciphering");
+      goto out;
+    }
+    if (!conn->ap2_pairing_context.event_cipher_bundle.description)
+      conn->ap2_pairing_context.event_cipher_bundle.description = strdup("Event Stream");
+
+    debug(1, "Connection %d: pair-verify completed, session ciphers established",
+          conn->connection_number);
+  }
 
 out:
   resp->content = (char *)body; // these will be freed when the data is sent
@@ -2667,6 +2688,16 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
               conn->session_key = NULL;
             }
           }
+        } else if ((conn->pair_verify_result != NULL) &&
+                   (conn->pair_verify_result->shared_secret_len == 32)) {
+          // Realtime (type 96) AirPlay 2 streams carry no per-stream shk; the
+          // sender encrypts the audio with the session key both sides
+          // established during pair-verify, so use that.
+          conn->session_key = malloc(32);
+          memcpy(conn->session_key, conn->pair_verify_result->shared_secret, 32);
+          debug(1,
+                "Connection %d: no shk in SETUP, using the pair-verify session key as the audio stream key.",
+                conn->connection_number);
         } else {
           warn("No session key (shk) property in setup! This is fatal!");
           // This doesn't work right now. Not sure how to proceed.

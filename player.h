@@ -465,6 +465,7 @@ typedef struct {
 
   ap2_pairing ap2_pairing_context;
   struct pair_result *pair_setup_result; // need to keep the shared secret
+  struct pair_result *pair_verify_result; // session key from pair-verify (AirPlay 2)
 
   int event_socket;
   int data_socket;
